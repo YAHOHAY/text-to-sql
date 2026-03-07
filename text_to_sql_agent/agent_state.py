@@ -18,3 +18,5 @@ class SQLAgentState(TypedDict):
 
     # 4. 算法级防御
     retry_count: int  # 防止大模型陷入“写错 -> 报错 -> 继续写错”的死循环
+
+    final_answer: str
