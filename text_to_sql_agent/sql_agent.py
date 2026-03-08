@@ -7,7 +7,9 @@ from sqlglot.expressions import Select
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 from agent_state import SQLAgentState
-
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.documents import Document
 # 引入 LangChain 的 JSON 解析器，用于处理纯文本到 JSON 字典的转换
 from langchain_core.output_parsers import JsonOutputParser
 
@@ -19,6 +21,27 @@ llm = ChatOpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url="https://api.deepseek.com",
     temperature=0
+)
+# 1. 实例化本地词向量模型 (将文本转换为数值向量)
+embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+
+# 2. 模拟企业级数据字典 (将表结构拆分为独立的 Document 对象)
+table_documents = [
+    Document(
+        page_content="表名: users。包含用户基本信息。字段: user_id (主键), name (姓名), age (年龄), vip_level (VIP等级)。",
+        metadata={"table_name": "users"}
+    ),
+    Document(
+        page_content="表名: orders。包含用户订单流水记录。字段: order_id (主键), user_id (外键), amount (消费金额), order_date (订单日期)。",
+        metadata={"table_name": "orders"}
+    )
+]
+
+# 3. 将 Document 写入 Chroma 内存向量数据库
+vector_store = Chroma.from_documents(
+    documents=table_documents,
+    embedding=embeddings,
+    collection_name="enterprise_schemas"
 )
 
 
@@ -37,28 +60,39 @@ Table: orders (order_id INTEGER PRIMARY KEY, user_id INTEGER, amount DECIMAL, or
 """
 
 
+def retrieve_schema_node(state: SQLAgentState):
+    """新增节点：向量检索 (RAG)"""
+    question = state["user_question"]
+    print(f"\n[节点] RAG 检索: 正在向量空间匹配相关表结构...")
+
+    # 基于问题与表结构的向量余弦相似度，检索最相关的 2 张表 (k=2)
+    docs = vector_store.similarity_search(question, k=2)
+
+    # 将检索到的 Document 拼接为纯文本
+    retrieved_info = "\n".join([doc.page_content for doc in docs])
+    print(f"[状态] 检索完毕，提取到以下表结构:\n{retrieved_info}")
+
+    # 存入 State
+    return {"relevant_schemas": retrieved_info}
+
+
 def generate_sql_node(state: SQLAgentState):
-    """节点 1：生成 SQL"""
+    """修改原节点：基于检索结果生成 SQL"""
     question = state["user_question"]
     error = state.get("error_message")
     retry = state.get("retry_count", 0)
 
-    # parser.get_format_instructions() 获取 Pydantic 模型对应的 JSON 格式要求，拼接到提示词中
-    prompt = f"你是一个 SQLite 专家。请根据表结构写出 SQL。\n{SCHEMA_INFO}\n问题: {question}\n\n输出要求：\n{parser.get_format_instructions()}"
+    # 核心变更：大模型不再读取全局 SCHEMA_INFO，而是读取 RAG 提供的 relevant_schemas
+    schemas = state["relevant_schemas"]
 
-    # 如果状态中包含错误信息，将其追加到提示词中让模型反思
+    prompt = f"你是一个 SQLite 专家。请严格根据以下表结构写出 SQL。\n{schemas}\n问题: {question}\n\n输出要求：\n{parser.get_format_instructions()}"
+
     if error:
         prompt += f"\n\n注意：上一次 SQL 执行报错！\n报错信息: {error}\n请修复 SQL 并重新输出 JSON！"
 
-    print(f"\n[节点] 生成 SQL (重试次数: {retry}/3)")
-
-    # 调用 LLM 获取纯文本响应
+    print(f"\n[节点] 生成 SQL (重试: {retry}/3)")
     response = llm.invoke(prompt)
-
-    # 将 LLM 返回的文本通过解析器转换为 Python 字典
     parsed_result = parser.invoke(response)
-
-    # 提取字典中的 sql_query 字段存入状态
     return {"generated_sql": parsed_result["sql_query"]}
 
 
@@ -177,20 +211,22 @@ def route_after_execution(state: SQLAgentState) -> str:
 # 重新组装图纸
 # ----------------------------------------
 workflow = StateGraph(SQLAgentState)
-
+# 注册所有节点
+workflow.add_node("retrieve_schema", retrieve_schema_node) # 新增注册
 workflow.add_node("generate_sql", generate_sql_node)
 workflow.add_node("validate_sql", validate_sql_node)
 workflow.add_node("execute_sql", execute_sql_node)
-# 新增：将汇报节点注册进状态图
 workflow.add_node("generate_report", generate_report_node)
 
-workflow.add_edge(START, "generate_sql")
+# 重构执行流：起点 -> 检索表结构 -> 生成 SQL -> 校验 -> 执行 -> 汇报
+workflow.add_edge(START, "retrieve_schema")
+workflow.add_edge("retrieve_schema", "generate_sql")
 workflow.add_edge("generate_sql", "validate_sql")
 workflow.add_conditional_edges("validate_sql", route_after_validation)
 workflow.add_conditional_edges("execute_sql", route_after_execution)
-
-# 新增：汇报节点走完后，整个流程才真正结束
 workflow.add_edge("generate_report", END)
+
+sql_app = workflow.compile()
 
 sql_app = workflow.compile()
 if __name__ == "__main__":

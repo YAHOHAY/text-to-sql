@@ -20,3 +20,6 @@ class SQLAgentState(TypedDict):
     retry_count: int  # 防止大模型陷入“写错 -> 报错 -> 继续写错”的死循环
 
     final_answer: str
+
+    # 新增：用于存放 RAG 节点检索出的相关表结构
+    relevant_schemas: str
