@@ -1,0 +1,42 @@
+version: "3.8"
+services:
+  db:
+    image: postgres:15
+    environment:
+      - POSTGRES_USER=odoo
+      - POSTGRES_PASSWORD=odoo
+      - POSTGRES_DB=postgres
+    ports:
+      - "5432:5432"
+
+    # Odoo ERP：启动时会自动连接 db 并生成几百张业务表
+  odoo:
+    image: odoo:16.0
+    depends_on:
+        - db
+    ports:
+        - "8069:8069"
+    environment:
+        - HOST=db
+        - USER=odoo
+        - PASSWORD=odoo
+
+
+
+
+  # 定义一个名为 api 的服务
+  api:
+    # 指定根据当前目录的 Dockerfile 进行构建
+    build: .
+    # 将宿主机的 8000 端口映射到容器的 8000 端口
+    ports:
+      - "8000:8000"
+    # 挂载卷：将宿主机的当前目录物理映射到容器的 /app，确保 SQLite 和 Chroma 数据不丢失
+    volumes:
+      - .:/app
+    # 将包含 DEEPSEEK_API_KEY 的环境变量文件注入容器
+    env_file:
+      - .env
+    # 覆盖 CMD：开启 --reload，当你修改代码时，FastAPI 会自动热重载，无需重启容器
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
